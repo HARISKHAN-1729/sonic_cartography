@@ -1,0 +1,42 @@
+# Core deep learning
+torch>=2.2.0
+torchvision>=0.17.0
+timm>=0.9.0
+einops>=0.7.0
+transformers>=4.52.4          # >=4.52.4 required for V-JEPA 2 (VJEPA2Model)
+accelerate>=0.27.0
+
+# Depth estimation (Depth Anything V2)
+# clone separately: https://github.com/DepthAnything/Depth-Anything-V2
+huggingface-hub>=0.22.0
+
+# Object detection (YOLO-World via ultralytics)
+ultralytics>=8.2.0
+
+# Audio / binaural
+soundfile>=0.12.1
+librosa>=0.10.1
+scipy>=1.12.0
+numpy>=1.26.0
+pyroomacoustics>=0.8.2
+
+# HRTF (MIT KEMAR or CIPIC dataset loader)
+# We ship a minimal HRTF via scipy — no extra install needed
+
+# Video I/O
+opencv-python>=4.9.0
+imageio[ffmpeg]>=2.34.0
+
+# Evaluation & plotting
+matplotlib>=3.8.0
+seaborn>=0.13.0
+pandas>=2.2.0
+tqdm>=4.66.0
+
+# Dataset
+# SANPO: https://github.com/google-research-datasets/sanpo-dataset
+gdown>=5.1.0
+
+# Config management
+pyyaml>=6.0.1
+omegaconf>=2.3.0

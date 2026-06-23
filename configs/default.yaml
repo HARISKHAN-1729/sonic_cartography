@@ -1,0 +1,127 @@
+# ── Predictive Sonic Cartography — default config (PIXEL path) ─────────────
+
+# Selects the PIXEL scene predictor for eval/evaluate_unified.py:
+# world_model (flow|nwm|last_frame) -> predicted frame -> depth + detector.
+# For the LATENT path (V-JEPA 2 + probe) use configs/vjepa.yaml.
+scene_predictor:
+  type: "pixel"
+
+# Which future-frame predictor to use. See models/world_model.py.
+#   "flow"       — optical-flow extrapolation. CPU-friendly, no checkpoint,
+#                  works on pedestrian data. RECOMMENDED DEFAULT + baseline.
+#   "nwm"        — faithful Navigation World Model (needs GPU, the cloned repo,
+#                  and a gated .pth.tar checkpoint). Best quality.
+#   "last_frame" — naive "predict = last frame". Trivial ablation lower bound.
+world_model:
+  backend: "flow"
+  prediction_fps: 8                        # frames/sec for horizon indexing
+  flow:
+    flow_amplify: 1.0                      # global multiplier on extrapolated motion
+    expand_on_approach: true               # emulate looming as you near objects
+
+model:
+  # Navigation World Model (only used when world_model.backend == "nwm").
+  #
+  # NOTE: the HF repo facebook/nwm ships GATED .pth.tar STATE-DICTS, not a
+  # from_pretrained() model. You must (1) clone github.com/facebookresearch/nwm
+  # and put it on PYTHONPATH, and (2) download a checkpoint and point
+  # checkpoint_path at it. See scripts/download_assets.py.
+  nwm:
+    repo: "https://github.com/facebookresearch/nwm"   # clone for models.py + diffusion/
+    model_size: "XL"                       # S | B | L | XL  (XL = 1B params)
+    # Path to the downloaded gated checkpoint (.pth.tar). For pedestrian /
+    # human-egocentric scenes the XL+Ego4D weights are the closest domain match:
+    #   checkpoints/cdit_xl_ego4d_200000.pth.tar
+    checkpoint_path: "checkpoints/cdit_xl_100000.pth.tar"
+    vae: "stabilityai/sd-vae-ft-ema"       # SD VAE used for latent encode/decode
+    image_size: 256                        # frames resized to this before VAE (÷8 latent)
+    context_frames: 4                      # context window length for CDiT
+    prediction_fps: 8                      # output fps of predicted frames
+    num_sampling_steps: 100                # diffusion steps (DDIM); lower = faster
+    walk_speed_mps: 1.4                    # synthesized forward speed for the action
+    action: "walk_forward"                 # conditioning intent (-> continuous pose delta)
+    device: "cuda"
+    dtype: "float16"                       # fp16 saves VRAM; use float32 on CPU
+
+  # Depth Anything V2
+  depth:
+    encoder: "vitl"                        # vitl (best) or vits (fastest)
+    checkpoint: "depth-anything/Depth-Anything-V2-Large-hf"
+    device: "cuda"
+    dtype: "float16"
+    input_size: 518                        # canonical input resolution
+
+  # YOLO-World object detector
+  detector:
+    checkpoint: "yolov8x-worldv2.pt"       # ultralytics pretrained
+    device: "cuda"
+    conf_threshold: 0.35
+    iou_threshold: 0.45
+    # categories relevant for pedestrian navigation
+    categories:
+      - person
+      - bicycle
+      - car
+      - motorbike
+      - bus
+      - truck
+      - traffic light
+      - stop sign
+      - bench
+      - door
+      - stairs
+      - curb
+      - pole
+      - fire hydrant
+      - bollard
+      - wall
+      - tree
+      - trash can
+      - table
+      - chair
+
+prediction:
+  horizons_sec: [0.5, 1.0, 1.5, 2.0, 2.5]   # lead times to evaluate
+  default_horizon_sec: 1.5                    # used in demo mode
+
+audio:
+  sample_rate: 44100
+  output_channels: 2                          # stereo binaural
+  hrtf_subject: "kemar"                       # KEMAR or cipic_003 etc.
+  # Earcon mapping: object class → base frequency (Hz)
+  # Low freq = large/structural, high freq = small/dynamic
+  earcon_frequencies:
+    person:        440    # A4 — most important dynamic hazard
+    bicycle:       550
+    car:           220    # Low drone — large fast vehicle
+    motorbike:     330
+    bus:           110
+    truck:         130
+    traffic_light: 880    # High ping — attention signal
+    stop_sign:     660
+    bench:         392    # G4 — static furniture
+    door:          494
+    stairs:        523    # C5 — navigation landmark
+    curb:          415    # G#4 — ground-level hazard
+    pole:          370
+    fire_hydrant:  349
+    bollard:       330
+    wall:          196    # Low structural
+    tree:          262
+    trash_can:     311
+    table:         294
+    chair:         277
+  # Volume curve: linear from max_gain (close) to min_gain (far)
+  max_gain_db: 0.0
+  min_gain_db: -30.0
+  max_distance_m: 8.0     # objects beyond this are inaudible
+  earcon_duration_ms: 120  # each earcon pulse length
+  pulse_interval_ms: 400   # gap between successive scene scans
+  fade_ms: 20              # fade in/out per earcon
+
+evaluation:
+  sanpo_split: "test"
+  max_clips: 500           # set to -1 for full dataset
+  iou_threshold: 0.5       # for object hit rate (bbox overlap)
+  depth_bins: 5            # number of depth range bins for analysis
+  save_audio_examples: 10  # save N example audio files alongside results

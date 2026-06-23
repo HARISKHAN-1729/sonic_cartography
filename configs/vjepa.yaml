@@ -1,0 +1,115 @@
+# ── Predictive Sonic Cartography — V-JEPA 2 latent config ──────────────────
+#
+# Selects the LATENT scene predictor: V-JEPA 2 (action-free, human-egocentric)
+# -> predicted future token grid -> trained probe -> Detections.
+#
+# For the pixel backends (flow / nwm / last_frame) use configs/default.yaml
+# with scene_predictor.type = pixel (see below).
+
+scene_predictor:
+  type: "latent"                 # "latent" (V-JEPA + probe) | "pixel" (world_model)
+  probe_path: "checkpoints/probe.pt"
+  conf_threshold: 0.5            # objectness threshold for emitting a detection
+  max_objects: 12
+
+# Used only when scene_predictor.type == "pixel"
+world_model:
+  backend: "flow"                # flow | nwm | last_frame
+  prediction_fps: 8
+  flow:
+    flow_amplify: 1.0
+    expand_on_approach: true
+
+model:
+  # V-JEPA 2 latent world model (used when scene_predictor.type == "latent")
+  vjepa:
+    checkpoint: "facebook/vjepa2-vitl-fpc64-256"   # ViT-L; or -vith- / -vitg-
+    device: "cuda"
+    dtype: "float16"
+    attn_implementation: "sdpa"
+    image_size: 256
+    frames_per_clip: 64          # V-JEPA 2 expects 64-frame clips
+    context_frames: 8            # how many real frames we feed as context
+    prediction_fps: 8            # horizon indexing
+    patch_size: 16
+    tubelet_size: 2
+
+  # Teacher depth model (labels for probe training; GT for evaluation)
+  depth:
+    encoder: "vitl"
+    checkpoint: "depth-anything/Depth-Anything-V2-Large-hf"
+    device: "cuda"
+    dtype: "float16"
+    input_size: 518
+    max_distance_m: 10.0
+
+  # Teacher detector (labels for probe training; GT for evaluation)
+  detector:
+    checkpoint: "yolov8x-worldv2.pt"
+    device: "cuda"
+    conf_threshold: 0.35
+    iou_threshold: 0.45
+    categories:
+      - person
+      - bicycle
+      - car
+      - motorbike
+      - bus
+      - truck
+      - traffic light
+      - stop sign
+      - bench
+      - door
+      - stairs
+      - curb
+      - pole
+      - fire hydrant
+      - bollard
+      - wall
+      - tree
+      - trash can
+      - table
+      - chair
+
+prediction:
+  horizons_sec: [0.5, 1.0, 1.5, 2.0, 2.5]
+  default_horizon_sec: 1.5
+
+audio:
+  sample_rate: 44100
+  output_channels: 2
+  hrtf_subject: "kemar"
+  max_gain_db: 0.0
+  min_gain_db: -30.0
+  max_distance_m: 8.0
+  earcon_duration_ms: 120
+  pulse_interval_ms: 400
+  fade_ms: 20
+  earcon_frequencies:
+    person: 440
+    bicycle: 550
+    car: 220
+    motorbike: 330
+    bus: 110
+    truck: 130
+    traffic_light: 880
+    stop_sign: 660
+    bench: 392
+    door: 494
+    stairs: 523
+    curb: 415
+    pole: 370
+    fire_hydrant: 349
+    bollard: 330
+    wall: 196
+    tree: 262
+    trash_can: 311
+    table: 294
+    chair: 277
+
+evaluation:
+  sanpo_split: "test"
+  max_clips: 200
+  iou_threshold: 0.5
+  depth_bins: 5
+  save_audio_examples: 10
