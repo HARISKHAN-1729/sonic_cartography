@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 import argparse
+import gzip
 import json
 import os
 import shutil
@@ -59,88 +60,216 @@ GCS_SPLITS_SYN  = f"{GCS_SYNTHETIC}/splits"
 # PATH A — Download SANPO-Synthetic test split
 # ══════════════════════════════════════════════════════════════════════════════
 
-def path_a_synthetic(max_sessions: int = -1):
+def path_a_synthetic(max_sessions: int = -1, want_panoptic: bool = False):
     """
-    Download SANPO-Synthetic test sessions.
+    Download SANPO-Synthetic test sessions in ONE command.
 
-    SANPO-Synthetic has pixel-perfect depth maps and panoptic masks,
-    making it ideal for offline evaluation — you know exactly where
-    every object is, so ground-truth detections can be derived directly
-    from the panoptic labels (no need to run YOLO-World on GT frames).
+    Real bucket layout (per session):
+        {base}/{session_id}/description.json
+        {base}/{session_id}/{camera_head|camera_chest}/left/video_frames/*.png
+        {base}/{session_id}/{sensor}/left/depth_maps/*.float16.gz   (metres)
+        {base}/{session_id}/{sensor}/left/segmentation_masks/*.png   (optional)
+        {base}/{session_id}/{sensor}/camera_poses.csv                (optional)
 
-    Structure after download:
-        data/sanpo/
-        └── sanpo-synthetic/
-            ├── splits/
-            │   ├── test.txt       ← list of test session IDs
-            │   └── train.txt
-            └── sessions/
-                ├── session_00001/
-                │   ├── rgb/            ← PNG frames
-                │   ├── depth/          ← .npz float32 depth (metres)
-                │   ├── panoptic/       ← panoptic mask PNGs
-                │   └── metadata.json
-                └── ...
+    Local layout produced (what SANPOLoader reads):
+        data/sanpo/sanpo-synthetic/splits/test_session_ids.txt
+        data/sanpo/sanpo-synthetic/sessions/{session_id}/rgb/*.png
+        data/sanpo/sanpo-synthetic/sessions/{session_id}/depth/*.npz  (float32 m)
+        data/sanpo/sanpo-synthetic/sessions/{session_id}/metadata.json
+        (panoptic/ and camera_poses.csv only if requested / available)
 
-    Approximate sizes:
-        Full synthetic (1961 sessions): ~50 GB
-        Test split only (~392 sessions): ~10 GB
-        RGB only (no panoptic): ~6 GB
+    Depth files are *.float16.gz: the first two float16 values are H and W,
+    the rest are metric depth; we convert each to a compressed .npz.
+
+    Sizes: full test split ~10 GB; --max_sessions caps it (try 1 first).
     """
-    print("\n" + "═"*60)
-    print("PATH A — SANPO-Synthetic download")
-    print("═"*60)
-
+    print("\n" + "═" * 60)
+    print("PATH A — SANPO-Synthetic download (single command)")
+    print("═" * 60)
     _check_gcloud()
 
     out_dir = DATA_DIR / "sanpo-synthetic"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Step 1: Download splits file to know which sessions are in test
-    print("\n[1/3] Downloading split lists...")
-    _gcloud_cp(f"{GCS_SPLITS_SYN}/", str(out_dir / "splits"), recursive=True)
-
-    splits_test_path = out_dir / "splits" / "test.txt"
-    if not splits_test_path.exists():
-        # Fallback: list and filter by name
-        print("  Splits file not found at expected path, listing bucket...")
-        sessions = _list_bucket_sessions(GCS_SYNTHETIC + "/sessions/")
-    else:
-        with open(splits_test_path) as f:
-            sessions = [line.strip() for line in f if line.strip()]
-        print(f"  Found {len(sessions)} sessions in test split")
-
-    if max_sessions > 0:
-        sessions = sessions[:max_sessions]
-        print(f"  Limiting to first {max_sessions} sessions")
-
-    # Step 2: Download sessions
     sessions_dir = out_dir / "sessions"
-    sessions_dir.mkdir(exist_ok=True)
+    sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[2/3] Downloading {len(sessions)} sessions...")
-    print("  (This includes RGB frames + depth NPZ files)")
-    print("  Tip: interrupt at any time; gcloud resumes partial downloads\n")
+    # ── Step 1: resolve the list of test session IDs ───────────────────────
+    print("\n[1/3] Resolving test session IDs...")
+    session_ids = _ensure_split_ids(GCS_SYNTHETIC, out_dir, split="test")
+    if not session_ids:
+        raise RuntimeError(
+            "Could not resolve any session IDs. Check bucket access with:\n"
+            f"  gcloud storage ls {GCS_SYNTHETIC}/"
+        )
+    if max_sessions > 0:
+        session_ids = session_ids[:max_sessions]
+    print(f"  Using {len(session_ids)} session(s).")
 
-    for i, session_id in enumerate(sessions):
-        dest = sessions_dir / session_id
-        if dest.exists() and _session_complete(dest):
-            print(f"  [{i+1}/{len(sessions)}] {session_id} — already complete, skipping")
+    # ── Step 2 & 3: per-session download + depth conversion ────────────────
+    print(f"\n[2/3] Downloading + [3/3] converting {len(session_ids)} session(s)...\n")
+    for i, sid in enumerate(session_ids, start=1):
+        print(f"[{i}/{len(session_ids)}] {sid}")
+        local_session = sessions_dir / sid
+        needs_masks = want_panoptic and not any(
+            (local_session / "panoptic").glob("*.png")
+            if (local_session / "panoptic").exists() else [])
+        if local_session.exists() and _session_complete(local_session) \
+                and not needs_masks:
+            print("  already complete — skipping")
             continue
-
-        print(f"  [{i+1}/{len(sessions)}] {session_id}...")
-        src = f"{GCS_SYNTHETIC}/sessions/{session_id}"
-        _gcloud_cp(src, str(dest), recursive=True,
-                   exclude=["*_right.png", "*.mp4"])  # skip right-eye frames + video
-
-    # Step 3: Convert to our loader format
-    print(f"\n[3/3] Converting to sonic_cartography format...")
-    _convert_synthetic_to_loader_format(out_dir)
+        if local_session.exists() and _session_complete(local_session) \
+                and needs_masks:
+            # Backfill only the segmentation masks (rgb/depth kept as-is).
+            print("  backfilling panoptic masks only...")
+            sensor = _detect_sensor(f"{GCS_SYNTHETIC}/{sid}")
+            _download_pattern(
+                f"{GCS_SYNTHETIC}/{sid}/{sensor}/left/segmentation_masks/*.png",
+                local_session / "panoptic")
+            n_masks = len(list((local_session / "panoptic").glob("*.png")))
+            print(f"  masks: {n_masks}  ✓")
+            continue
+        _download_synthetic_session(
+            remote_session=f"{GCS_SYNTHETIC}/{sid}",
+            local_session=local_session,
+            want_panoptic=want_panoptic,
+        )
 
     print(f"\n✓ SANPO-Synthetic ready at: {out_dir}")
-    print(f"  Sessions: {len(list((sessions_dir).iterdir()))}")
-    print(f"\nTest with:")
-    print(f"  python eval/evaluate.py --sanpo_root {DATA_DIR} --max_clips 20")
+    print(f"  Sessions on disk: {len(list(sessions_dir.iterdir()))}")
+    print("\nNext:")
+    print(f"  python train_probe.py --config configs/vjepa.yaml "
+          f"--sanpo_root {DATA_DIR} --out checkpoints/probe.pt --steps 4000")
+    print(f"  python eval/evaluate_unified.py --config configs/vjepa.yaml "
+          f"--sanpo_root {DATA_DIR} --output eval/results_vjepa.json")
+
+
+# ── Path A helpers ──────────────────────────────────────────────────────────
+
+def _ensure_split_ids(base: str, local_base: Path, split: str = "test") -> list:
+    """
+    Return the list of session IDs for `split`. Strategy:
+      1. use a local splits file if already present;
+      2. else download a remote splits file (trying common names);
+      3. else list the bucket top level and derive session IDs directly.
+    """
+    splits_dir = local_base / "splits"
+    splits_dir.mkdir(parents=True, exist_ok=True)
+    local_file = splits_dir / f"{split}_session_ids.txt"
+
+    # 1) local file already there
+    if local_file.exists():
+        ids = [l.strip() for l in local_file.read_text().splitlines() if l.strip()]
+        if ids:
+            print(f"  Using existing split file: {local_file}")
+            return ids
+
+    # 2) try downloading a remote splits file (ensure dest dir exists; copy file)
+    for remote_name in (f"{split}_session_ids.txt", f"{split}.txt",
+                         f"{split}_clips.txt"):
+        remote = f"{base}/splits/{remote_name}"
+        if _remote_exists(remote):
+            run([
+                "gcloud", "storage", "cp", remote, str(local_file),
+            ])
+            ids = [l.strip() for l in local_file.read_text().splitlines() if l.strip()]
+            if ids:
+                print(f"  Downloaded split file: {remote_name} ({len(ids)} ids)")
+                return ids
+
+    # 3) derive from a bucket listing (filter out non-session entries)
+    print("  No splits file found; listing bucket to derive session IDs...")
+    ids = _list_bucket_sessions(base + "/")
+    # write them out so subsequent runs are reproducible
+    if ids:
+        local_file.write_text("\n".join(ids) + "\n")
+        print(f"  Derived {len(ids)} session IDs and wrote {local_file}")
+    return ids
+
+
+def _download_synthetic_session(remote_session: str, local_session: Path,
+                                want_panoptic: bool = False) -> None:
+    """Download one SANPO-Synthetic session and convert its depth to .npz."""
+    rgb_dir = local_session / "rgb"
+    raw_depth_dir = local_session / "depth_raw"
+    depth_dir = local_session / "depth"
+    panoptic_dir = local_session / "panoptic"
+
+    sensor = _detect_sensor(remote_session)
+    print(f"  sensor: {sensor}")
+    remote_left = f"{remote_session}/{sensor}/left"
+
+    _download_pattern(f"{remote_left}/video_frames/*.png", rgb_dir)
+    _download_pattern(f"{remote_left}/depth_maps/*.float16.gz", raw_depth_dir)
+    if want_panoptic:
+        _download_pattern(f"{remote_left}/segmentation_masks/*.png", panoptic_dir)
+
+    # metadata (description.json -> metadata.json)
+    desc = f"{remote_session}/description.json"
+    if _remote_exists(desc):
+        run(["gcloud", "storage", "cp", desc, str(local_session / "metadata.json")])
+
+    # optional camera poses
+    poses = f"{remote_session}/{sensor}/camera_poses.csv"
+    if _remote_exists(poses):
+        run(["gcloud", "storage", "cp", poses, str(local_session / "camera_poses.csv")])
+
+    print("  converting depth (.float16.gz -> .npz, metres)...")
+    n_depth = _convert_depth_files(raw_depth_dir, depth_dir)
+
+    rgb_n = len(list(rgb_dir.glob("*.png")))
+    print(f"  rgb frames: {rgb_n}   depth maps: {n_depth}")
+    if rgb_n < 10 or n_depth < 10:
+        raise RuntimeError(f"Too few frames downloaded for {local_session.name}; "
+                           "delete the session folder and re-run.")
+
+    # remove the raw .gz depth once conversion succeeded
+    if n_depth == len(list(raw_depth_dir.glob('*.float16.gz'))):
+        shutil.rmtree(raw_depth_dir, ignore_errors=True)
+    print("  ✓ session complete")
+
+
+def _detect_sensor(remote_session: str) -> str:
+    """Return 'camera_head' or 'camera_chest' depending on which exists."""
+    for sensor in ("camera_head", "camera_chest"):
+        probe = f"{remote_session}/{sensor}/left/video_frames/000000.png"
+        if _remote_exists(probe):
+            return sensor
+    raise RuntimeError(f"No camera_head/camera_chest under {remote_session}")
+
+
+def _download_pattern(source_glob: str, destination: Path) -> None:
+    """Download all objects matching a GCS wildcard into an existing dir."""
+    destination.mkdir(parents=True, exist_ok=True)
+    run(["gcloud", "storage", "cp", "--no-clobber",
+         source_glob, str(destination) + "/"])
+
+
+def _convert_depth_files(raw_dir: Path, output_dir: Path) -> int:
+    """
+    Convert SANPO *.float16.gz depth maps to compressed .npz (float32 metres).
+    First two float16 values are H and W; the rest are metric depth.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    converted = 0
+    raw_files = sorted(raw_dir.glob("*.float16.gz"))
+    for idx, raw_path in enumerate(raw_files, start=1):
+        out_path = output_dir / (raw_path.name.removesuffix(".float16.gz") + ".npz")
+        if out_path.exists():
+            converted += 1
+            continue
+        with gzip.open(raw_path, "rb") as fh:
+            values = np.frombuffer(fh.read(), dtype="<f2")
+        if values.size < 3:
+            raise ValueError(f"Invalid depth file: {raw_path}")
+        h, w = int(values[0]), int(values[1])
+        pixels = values[2:]
+        if h <= 0 or w <= 0 or pixels.size != h * w:
+            raise ValueError(f"Bad depth dims {h}x{w} in {raw_path}")
+        depth = pixels.reshape(h, w).astype(np.float32)
+        np.savez_compressed(out_path, depth=depth)
+        converted += 1
+        if idx % 50 == 0:
+            print(f"    {idx}/{len(raw_files)} depth maps")
+    return converted
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -594,17 +723,43 @@ def _gcloud_cp(src: str, dest: str, recursive: bool = False,
     subprocess.run(cmd, check=True)
 
 
+def run(command: list) -> None:
+    """Run a gcloud (or other) command, echoing it, raising on failure."""
+    print("    $", " ".join(map(str, command)))
+    subprocess.run(command, check=True)
+
+
+def _remote_exists(uri: str) -> bool:
+    """True if a GCS object/prefix exists (quietly)."""
+    result = subprocess.run(
+        ["gcloud", "storage", "ls", uri],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+# Entries at the synthetic top level that are NOT sessions.
+_NON_SESSION_NAMES = {"splits", "LICENSE", "README", "metadata", ""}
+
+
 def _list_bucket_sessions(prefix: str) -> list[str]:
-    """List session IDs in a GCS bucket prefix."""
+    """List session IDs at a GCS prefix, excluding non-session entries/files."""
     result = subprocess.run(
         ["gcloud", "storage", "ls", prefix],
         capture_output=True, text=True, check=True
     )
     sessions = []
     for line in result.stdout.strip().split("\n"):
-        name = line.strip().rstrip("/").split("/")[-1]
-        if name:
-            sessions.append(name)
+        line = line.strip()
+        if not line:
+            continue
+        is_dir = line.endswith("/")                 # sessions are folders
+        name = line.rstrip("/").split("/")[-1]
+        if not is_dir:                              # skip top-level files
+            continue
+        if name in _NON_SESSION_NAMES or "." in name:
+            continue
+        sessions.append(name)
     return sessions
 
 
@@ -644,10 +799,12 @@ Examples:
                    help="Directory with your own video files (Path C only)")
     p.add_argument("--fps", type=int, default=10,
                    help="Target fps for frame extraction (Path C only)")
+    p.add_argument("--panoptic", action="store_true",
+                   help="Also download segmentation masks (Path A; not needed by the pipeline)")
     args = p.parse_args()
 
     if args.path == "a":
-        path_a_synthetic(max_sessions=args.max_sessions)
+        path_a_synthetic(max_sessions=args.max_sessions, want_panoptic=args.panoptic)
     elif args.path == "b":
         path_b_real(max_sessions=args.max_sessions)
     elif args.path == "c":
