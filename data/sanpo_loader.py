@@ -46,6 +46,7 @@ class SANPOClip:
     depth_frames: List[Path]  # matching depth frame paths
     fps: float
     metadata: dict
+    mask_frames: List[Path] = None   # panoptic segmentation masks (optional)
 
 
 @dataclass
@@ -73,6 +74,7 @@ class SANPOLoader:
 
     DEFAULT_FPS = 10.0
     DEPTH_SCALE_MM_TO_M = 0.001  # uint16 PNG stores depth in mm
+    DEPTH_MAX_M = 100.0          # clamp sky/inf; downstream caps at ~8-10 m anyway
 
     def __init__(
         self,
@@ -90,70 +92,87 @@ class SANPOLoader:
         self._scan_dataset()
 
     def _scan_dataset(self) -> None:
-        """Discover all clips in the dataset directory."""
-        split_file = self.root / f"{self.split}_clips.txt"
-
-        if split_file.exists():
-            # Use official split file if available
-            with open(split_file) as f:
-                clip_ids = [line.strip() for line in f if line.strip()]
-        else:
-            # Fall back to scanning all directories
-            clip_ids = None
+        """
+        Discover clips by finding any directory that contains an ``rgb/``
+        subfolder with frames. This handles both the legacy
+        ``<root>/{outdoor,indoor}/<clip>/`` layout and the real SANPO layout
+        produced by the downloader: ``<root>/sanpo-synthetic/sessions/<id>/``.
+        """
+        # Resolve a split id-list if present (SANPO uses *_session_ids.txt).
+        clip_ids = None
+        split_candidates = []
+        for name in (f"{self.split}_session_ids.txt", f"{self.split}_clips.txt"):
+            split_candidates += [
+                self.root / "splits" / name,
+                self.root / "sanpo-synthetic" / "splits" / name,
+                self.root / name,
+            ]
+        for sp in split_candidates:
+            if sp.exists():
+                clip_ids = [l.strip() for l in sp.read_text().splitlines() if l.strip()]
+                break
 
         count = 0
-        for scene_type in self.scene_types:
-            scene_dir = self.root / scene_type
-            if not scene_dir.exists():
+        seen = set()
+        # Any folder with an rgb/ child is a clip, at any depth under root.
+        for rgb_dir in sorted(self.root.glob("**/rgb")):
+            if not rgb_dir.is_dir():
+                continue
+            clip_dir = rgb_dir.parent
+            if clip_dir in seen:
+                continue
+            seen.add(clip_dir)
+
+            if clip_ids is not None and clip_dir.name not in clip_ids:
                 continue
 
-            for clip_dir in sorted(scene_dir.iterdir()):
-                if not clip_dir.is_dir():
-                    continue
+            rgb_frames = sorted(
+                list(rgb_dir.glob("*.png")) + list(rgb_dir.glob("*.jpg")),
+                key=lambda p: p.stem,
+            )
+            if len(rgb_frames) < 10:        # skip very short clips
+                continue
 
-                # Filter by official split if available
-                if clip_ids is not None and clip_dir.name not in clip_ids:
-                    continue
+            depth_dir = clip_dir / "depth"
+            depth_frames = []
+            if depth_dir.exists():
+                # .npz (SANPO-Synthetic, metres) preferred; .png (uint16 mm) fallback.
+                depth_frames = sorted(
+                    list(depth_dir.glob("*.npz")) + list(depth_dir.glob("*.png")),
+                    key=lambda p: p.stem,
+                )
 
-                rgb_dir   = clip_dir / "rgb"
-                depth_dir = clip_dir / "depth"
+            mask_dir = clip_dir / "panoptic"
+            mask_frames = []
+            if mask_dir.exists():
+                mask_frames = sorted(mask_dir.glob("*.png"), key=lambda p: p.stem)
 
-                if not rgb_dir.exists():
-                    continue
+            meta_path = clip_dir / "metadata.json"
+            metadata = {}
+            if meta_path.exists():
+                try:
+                    metadata = json.loads(meta_path.read_text())
+                except Exception:
+                    metadata = {}
 
-                rgb_frames = sorted(rgb_dir.glob("*.jpg")) + \
-                             sorted(rgb_dir.glob("*.png"))
-                rgb_frames.sort(key=lambda p: p.stem)
+            fps = float(metadata.get("fps", self.DEFAULT_FPS))
+            low = str(clip_dir).lower()
+            scene_type = ("indoor" if "indoor" in low else
+                          "outdoor" if "outdoor" in low else "synthetic")
 
-                depth_frames = []
-                if depth_dir.exists():
-                    depth_frames = sorted(depth_dir.glob("*.png"))
-                    depth_frames.sort(key=lambda p: p.stem)
+            self._clips.append(SANPOClip(
+                clip_id=clip_dir.name,
+                scene_type=scene_type,
+                rgb_frames=rgb_frames,
+                depth_frames=depth_frames,
+                fps=fps,
+                metadata=metadata,
+                mask_frames=mask_frames,
+            ))
 
-                if len(rgb_frames) < 20:  # skip very short clips
-                    continue
-
-                # Load metadata
-                meta_path = clip_dir / "metadata.json"
-                metadata = {}
-                if meta_path.exists():
-                    with open(meta_path) as f:
-                        metadata = json.load(f)
-
-                fps = float(metadata.get("fps", self.DEFAULT_FPS))
-
-                self._clips.append(SANPOClip(
-                    clip_id=clip_dir.name,
-                    scene_type=scene_type,
-                    rgb_frames=rgb_frames,
-                    depth_frames=depth_frames,
-                    fps=fps,
-                    metadata=metadata,
-                ))
-
-                count += 1
-                if self.max_clips > 0 and count >= self.max_clips:
-                    return
+            count += 1
+            if self.max_clips > 0 and count >= self.max_clips:
+                return
 
     def __len__(self) -> int:
         return len(self._clips)
@@ -168,21 +187,34 @@ class SANPOLoader:
         """Load a single RGB + depth frame pair."""
         rgb_path = clip.rgb_frames[frame_idx]
         rgb = np.array(Image.open(rgb_path).convert("RGB"))
+        H, W = rgb.shape[:2]
 
-        # Load depth if available
-        depth_m = np.zeros(rgb.shape[:2], dtype=np.float32)
+        depth_m = np.zeros((H, W), dtype=np.float32)
         if frame_idx < len(clip.depth_frames):
-            depth_raw = np.array(
-                Image.open(clip.depth_frames[frame_idx]), dtype=np.uint16
+            dp = clip.depth_frames[frame_idx]
+            if dp.suffix == ".npz":
+                # SANPO-Synthetic: float32 metres under key 'depth'.
+                with np.load(dp) as f:
+                    key = "depth" if "depth" in f.files else f.files[0]
+                    depth_m = f[key].astype(np.float32)
+            else:
+                # Legacy PNG: uint16 millimetres.
+                depth_raw = np.array(Image.open(dp), dtype=np.uint16)
+                depth_m = depth_raw.astype(np.float32) * self.DEPTH_SCALE_MM_TO_M
+
+            # Sanitize: sky / non-finite -> far (ignored downstream), clamp absurd values.
+            depth_m = np.nan_to_num(
+                depth_m, nan=self.DEPTH_MAX_M,
+                posinf=self.DEPTH_MAX_M, neginf=0.0,
             )
-            depth_m = depth_raw.astype(np.float32) * self.DEPTH_SCALE_MM_TO_M
-            # Resize to match RGB if necessary
-            if depth_m.shape != rgb.shape[:2]:
-                depth_img = Image.fromarray(depth_raw).resize(
-                    (rgb.shape[1], rgb.shape[0]), Image.NEAREST
+            depth_m = np.clip(depth_m, 0.0, self.DEPTH_MAX_M)
+
+            # Resize to match RGB if the depth map differs in size.
+            if depth_m.shape != (H, W):
+                depth_img = Image.fromarray(depth_m).resize(
+                    (W, H), Image.NEAREST
                 )
-                depth_m = np.array(depth_img, dtype=np.float32) * \
-                          self.DEPTH_SCALE_MM_TO_M
+                depth_m = np.array(depth_img, dtype=np.float32)
 
         timestamp_sec = frame_idx / clip.fps
 
@@ -193,6 +225,13 @@ class SANPOLoader:
             depth_m=depth_m,
             timestamp_sec=timestamp_sec,
         )
+
+    def load_mask_path(self, clip, frame_idx):
+        """Return the panoptic mask Path for a frame, or None if unavailable."""
+        mf = getattr(clip, "mask_frames", None) or []
+        if frame_idx < len(mf):
+            return mf[frame_idx]
+        return None
 
     def get_context_and_future(
         self,
