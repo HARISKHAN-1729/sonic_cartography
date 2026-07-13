@@ -71,6 +71,16 @@ model:
       - table
       - chair
 
+
+# Ground-truth layout extractor (teacher for probe training AND eval GT).
+# Follows SANPO's object definition: connected components of each unique
+# panoptic label covering >= min_px pixels.
+mask_teacher:
+  min_px: 100            # SANPO paper's object definition
+  max_area_frac: 0.25    # components bigger than this fraction = stuff, skip
+  max_range_m: 20.0      # ignore objects farther than this (navigation range)
+  taxonomy_path: null    # optional SANPO taxonomy json/csv for real names
+
 prediction:
   horizons_sec: [0.5, 1.0, 1.5, 2.0, 2.5]
   default_horizon_sec: 1.5
